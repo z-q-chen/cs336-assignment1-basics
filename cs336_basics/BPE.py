@@ -2,7 +2,6 @@ import os
 import regex as re
 from collections import defaultdict, Counter
 from collections.abc import Iterable, Iterator
-import pickle
 from concurrent.futures import ThreadPoolExecutor
 
 from .pretokenization_example import find_chunk_boundaries

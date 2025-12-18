@@ -120,3 +120,59 @@ def scaled_dot_product_attention(
     output = einsum(attn_weights, V, "... seqq seqk, ... seqk d_v -> ... seqq d_v")
     return output
 
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(
+        self, 
+        d_model: int, 
+        num_heads: int, 
+        theta: float | None = None,
+        max_seq_len: int | None = None,
+        device=None, 
+        dtype=None
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.d_v = d_model // num_heads
+        self.device = device
+        self.dtype = dtype
+        
+        _d_model = num_heads * self.d_k
+        self.w_q = Linear(d_model, _d_model, device=device, dtype=dtype)
+        self.w_k = Linear(d_model, _d_model, device=device, dtype=dtype)
+        self.w_v = Linear(d_model, _d_model, device=device, dtype=dtype)
+        self.w_o = Linear(_d_model, d_model, device=device, dtype=dtype)
+        
+        self.rope = None
+        if theta is not None and max_seq_len is not None:
+            self.rope = RoPE(theta, self.d_k, max_seq_len, device=device)
+        
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        token_pos: torch.Tensor | None = None
+    )-> torch.Tensor:
+        
+        Q=self.w_q(x)
+        K=self.w_k(x)
+        V=self.w_v(x)
+        
+        Q = rearrange(Q, "... seq (num_heads d_k) -> ... num_heads seq d_k", num_heads=self.num_heads)
+        K = rearrange(K, "... seq (num_heads d_k) -> ... num_heads seq d_k", num_heads=self.num_heads)
+        V = rearrange(V, "... seq (num_heads d_v) -> ... num_heads seq d_v", num_heads=self.num_heads)
+        
+        if self.rope is not None and token_pos is not None:
+            Q = self.rope(Q, token_pos)
+            K = self.rope(K, token_pos)
+        
+        if mask is None:
+            seq_len = x.size(-2)
+            mask = torch.ones(seq_len, seq_len, device=x.device).tril()
+        
+        attn_output = scaled_dot_product_attention(Q, K, V, mask)
+        attn_output = rearrange(attn_output, "... num_heads seq d_v -> ... seq (num_heads d_v)")
+        
+        output = self.w_o(attn_output)
+        return output

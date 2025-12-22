@@ -18,7 +18,7 @@ class Linear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return einsum(x, self.weight, "... in_features, out_features in_features -> ... out_features")
     
-class Embeddinng(nn.Module):
+class Embedding(nn.Module):
     def __init__(self, num_embeddings: int, embedding_dim: int, device=None, dtype=None):
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -88,7 +88,10 @@ class RoPE(nn.Module):
         self.register_buffer("cos_cache", freqs.cos(), persistent=False)
         self.register_buffer("sin_cache", freqs.sin(), persistent=False)
     
-    def forward(self, x: torch.Tensor, token_pos: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, token_pos: torch.Tensor|None = None) -> torch.Tensor:
+        if token_pos is None:
+            seq_len = x.size(-2)
+            token_pos = torch.arange(seq_len, device=x.device)
         cos = self.cos_cache[token_pos]  # (seq_len, d_k/2)
         sin = self.sin_cache[token_pos]  # (seq_len, d_k/2)
         x_odd = x[..., 1::2]  
@@ -127,26 +130,22 @@ class MultiHeadSelfAttention(nn.Module):
         num_heads: int, 
         theta: float | None = None,
         max_seq_len: int | None = None,
-        device=None, 
-        dtype=None
     ):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
         self.d_v = d_model // num_heads
-        self.device = device
-        self.dtype = dtype
         
         _d_model = num_heads * self.d_k
-        self.w_q = Linear(d_model, _d_model, device=device, dtype=dtype)
-        self.w_k = Linear(d_model, _d_model, device=device, dtype=dtype)
-        self.w_v = Linear(d_model, _d_model, device=device, dtype=dtype)
-        self.w_o = Linear(_d_model, d_model, device=device, dtype=dtype)
+        self.w_q = Linear(d_model, _d_model)
+        self.w_k = Linear(d_model, _d_model)
+        self.w_v = Linear(d_model, _d_model)
+        self.w_o = Linear(_d_model, d_model)
         
         self.rope = None
         if theta is not None and max_seq_len is not None:
-            self.rope = RoPE(theta, self.d_k, max_seq_len, device=device)
+            self.rope = RoPE(theta, self.d_k, max_seq_len)
         
     def forward(
         self,
@@ -154,7 +153,6 @@ class MultiHeadSelfAttention(nn.Module):
         mask: torch.Tensor | None = None,
         token_pos: torch.Tensor | None = None
     )-> torch.Tensor:
-        
         Q=self.w_q(x)
         K=self.w_k(x)
         V=self.w_v(x)
@@ -163,10 +161,10 @@ class MultiHeadSelfAttention(nn.Module):
         K = rearrange(K, "... seq (num_heads d_k) -> ... num_heads seq d_k", num_heads=self.num_heads)
         V = rearrange(V, "... seq (num_heads d_v) -> ... num_heads seq d_v", num_heads=self.num_heads)
         
-        if self.rope is not None and token_pos is not None:
+        if self.rope is not None:
             Q = self.rope(Q, token_pos)
             K = self.rope(K, token_pos)
-        
+                
         if mask is None:
             seq_len = x.size(-2)
             mask = torch.ones(seq_len, seq_len, device=x.device).tril()
@@ -176,3 +174,66 @@ class MultiHeadSelfAttention(nn.Module):
         
         output = self.w_o(attn_output)
         return output
+    
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        theta: float | None = None,
+        max_seq_len: int | None = None,
+        device=None,
+        dtype=None
+    ):
+        super().__init__()
+        if theta is not None and max_seq_len is not None:
+            self.attention = MultiHeadSelfAttention(d_model, num_heads, theta, max_seq_len)
+        else:
+            self.attention = MultiHeadSelfAttention(d_model, num_heads)
+        self.ffn = SwiGLU(d_model, d_ff)
+        self.ln1 = RMSNorm(d_model)
+        self.ln2 = RMSNorm(d_model)
+    
+    def forward(
+        self,
+        x: torch.Tensor
+    ) -> torch.Tensor:
+        attn_output = self.attention(self.ln1(x))
+        x = x + attn_output
+        ffn_output = self.ffn(self.ln2(x))
+        x = x + ffn_output    
+        return x
+
+class TransformerLM(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        context_len: int,
+        num_layers: int,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        theta: float | None = None
+    ):
+        super().__init__()
+        self.embedding = Embedding(vocab_size, d_model)
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList([
+            TransformerBlock(d_model, num_heads, d_ff, theta, context_len)
+            for _ in range(num_layers)
+        ])
+        self.norm = RMSNorm(d_model)
+        self.linear = Linear(d_model, vocab_size)
+        self.softmax = softmax
+    
+    def forward(
+        self,
+        token_ids: torch.Tensor
+    ) -> torch.Tensor:
+        x = self.embedding(token_ids)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x)
+        logits = self.linear(x)
+        return logits
